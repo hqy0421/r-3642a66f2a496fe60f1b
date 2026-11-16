@@ -11,7 +11,13 @@ import itertools
 
 import numpy as np
 from patsy import PatsyError
-from patsy.categorical import guess_categorical, CategoricalSniffer, categorical_to_int
+from patsy.categorical import (
+    guess_categorical,
+    CategoricalSniffer,
+    categorical_to_int,
+    probability_to_matrix,
+    _ProbabilityCategoricalBox,
+)
 from patsy.util import (
     atleast_2d_column_default,
     have_pandas,
@@ -84,9 +90,19 @@ def _eval_factor(factor_info, data, NA_action):
                 factor,
             )
         return result, NA_action.is_numerical_NA(result)
-    # returns either a 1d ndarray or a pandas.Series, plus is_NA mask
+    # returns either a 1d ndarray of codes or a 2d (n_rows, n_levels)
+    # probability matrix, plus an is_NA mask
     else:
         assert factor_info.type == "categorical"
+        if isinstance(result, _ProbabilityCategoricalBox):
+            # Each row is a distribution over categories; return a dense
+            # (n_rows, n_levels) weight matrix instead of integer codes. The
+            # contrast matrix is applied later, during subterm assembly.
+            result, is_NA = probability_to_matrix(
+                result, factor_info.categories, NA_action, origin=factor_info.factor
+            )
+            assert result.ndim == 2
+            return result, np.asarray(is_NA)
         result = categorical_to_int(
             result, factor_info.categories, NA_action, origin=factor_info.factor
         )
@@ -277,18 +293,38 @@ def _subterm_column_names_iter(factor_infos, subterm):
 def _build_subterm(subterm, factor_infos, factor_values, out):
     assert subterm.num_columns == out.shape[1]
     out[...] = 1
+    # For each categorical factor, precompute the (n_rows, n_contrast_cols)
+    # matrix of encoded values. For ordinary categoricals this is just the
+    # contrast matrix indexed by level code; for probability-category factors
+    # it is the per-row weighted average of the contrast rows, i.e.
+    # probabilities @ contrast.matrix.
+    categorical_encodings = {}
+    for factor in subterm.factors:
+        if factor_infos[factor].type != "categorical":
+            continue
+        contrast = subterm.contrast_matrices[factor]
+        factor_value = factor_values[factor]
+        if factor_value.ndim == 1:
+            if np.any(factor_value < 0):
+                raise PatsyError(
+                    "can't build a design matrix containing missing values",
+                    factor,
+                )
+            categorical_encodings[factor] = contrast.matrix[factor_value, :]
+        else:
+            assert factor_value.shape[1] == len(factor_infos[factor].categories)
+            if np.any(np.isnan(factor_value)):
+                raise PatsyError(
+                    "can't build a design matrix containing missing values",
+                    factor,
+                )
+            categorical_encodings[factor] = factor_value.dot(contrast.matrix)
     for i, column_idxs in enumerate(
         _subterm_column_combinations(factor_infos, subterm)
     ):
         for factor, column_idx in zip(subterm.factors, column_idxs):
             if factor_infos[factor].type == "categorical":
-                contrast = subterm.contrast_matrices[factor]
-                if np.any(factor_values[factor] < 0):
-                    raise PatsyError(
-                        "can't build a design matrix containing missing values",
-                        factor,
-                    )
-                out[:, i] *= contrast.matrix[factor_values[factor], column_idx]
+                out[:, i] *= categorical_encodings[factor][:, column_idx]
             else:
                 assert factor_infos[factor].type == "numerical"
                 assert (

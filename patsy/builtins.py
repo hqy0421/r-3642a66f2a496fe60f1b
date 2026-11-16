@@ -14,9 +14,9 @@ from patsy.contrasts import ContrastMatrix, Treatment, Poly, Sum, Helmert, Diff
 
 __all__ += ["ContrastMatrix", "Treatment", "Poly", "Sum", "Helmert", "Diff"]
 
-from patsy.categorical import C
+from patsy.categorical import C, C_prob
 
-__all__ += ["C"]
+__all__ += ["C", "C_prob"]
 
 from patsy.state import center, standardize, scale
 

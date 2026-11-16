@@ -796,3 +796,226 @@ def test_DesignInfo_subset():
     min_di_subset = min_di.subset(["c", "a"])
     assert min_di_subset.column_names == ["c", "a"]
     assert min_di_subset.terms is None
+
+
+def test_C_prob_point_mass_matches_C():
+    # A point distribution over a single category must reproduce ordinary C
+    # exactly, for full and reduced codings and for several contrasts.
+    labels = ["a1", "a3", "a1", "a2"]
+    probs = [{label: 1.0} for label in labels]
+
+    def dmatrix_safe(formula, data):
+        from patsy.highlevel import dmatrix
+
+        return dmatrix(formula, data)
+
+    for contrast_suffix in ["", ", Sum", ", Helmert", ", Poly", ", Diff"]:
+        for prefix in ["", "0 + "]:
+            prob_m = dmatrix_safe(
+                prefix + "C_prob(p%s)" % contrast_suffix, {"p": probs}
+            )
+            hard_m = dmatrix_safe(prefix + "C(a%s)" % contrast_suffix, {"a": labels})
+            assert np.allclose(prob_m, hard_m)
+            # Column names only differ by the factor name.
+            assert [
+                name.replace("C_prob(p", "C(a")
+                for name in prob_m.design_info.column_names
+            ] == hard_m.design_info.column_names
+
+
+def test_C_prob_normalization():
+    # Weights are normalized per row; scaling a row's weights has no effect.
+    from patsy.highlevel import dmatrix
+
+    p = [{"a": 1.0, "b": 3.0}, {"a": 200.0, "b": 600.0}]
+    m = dmatrix("0 + C_prob(p, levels=['a', 'b'])", {"p": p})
+    assert np.allclose(m, [[0.25, 0.75], [0.25, 0.75]])
+
+    # Fractional weights work too.
+    m = dmatrix("0 + C_prob(p, levels=['a', 'b'])", {"p": [{"a": 0.2, "b": 0.3}]})
+    assert np.allclose(m, [[0.4, 0.6]])
+
+
+def test_C_prob_interaction():
+    # Interactions of probability factors multiply their encoded columns, just
+    # like ordinary categorical factors, and match the equivalent hard-label
+    # design with the same point masses.
+    from patsy.highlevel import dmatrix
+
+    data = {
+        "p": [{"a": 1.0}, {"b": 1.0}, {"a": 1.0}],
+        "q": [{"x": 1.0}, {"y": 1.0}, {"y": 1.0}],
+        "c": ["a", "b", "a"],
+        "d": ["x", "y", "y"],
+        "z": [1.0, 2.0, 3.0],
+    }
+    prob = dmatrix("C_prob(p) + C_prob(q) + C_prob(p):C_prob(q) + C_prob(p):z", data)
+    hard = dmatrix("C(c) + C(d) + C(c):C(d) + C(c):z", data)
+    assert prob.design_info.column_names == [
+        "Intercept",
+        "C_prob(p)[T.b]",
+        "C_prob(q)[T.y]",
+        "C_prob(p)[T.b]:C_prob(q)[T.y]",
+        "C_prob(p)[a]:z",
+        "C_prob(p)[b]:z",
+    ]
+    assert np.allclose(prob, hard)
+
+    # A genuinely soft interaction multiplies the two probability encodings.
+    soft = dmatrix(
+        "0 + C_prob(p, levels=['a', 'b']):C_prob(q, levels=['x', 'y'])",
+        {
+            "p": [{"a": 0.5, "b": 0.5}],
+            "q": [{"x": 0.25, "y": 0.75}],
+        },
+    )
+    assert soft.design_info.column_names == [
+        "C_prob(p, levels=['a', 'b'])[a]:C_prob(q, levels=['x', 'y'])[x]",
+        "C_prob(p, levels=['a', 'b'])[b]:C_prob(q, levels=['x', 'y'])[x]",
+        "C_prob(p, levels=['a', 'b'])[a]:C_prob(q, levels=['x', 'y'])[y]",
+        "C_prob(p, levels=['a', 'b'])[b]:C_prob(q, levels=['x', 'y'])[y]",
+    ]
+    assert np.allclose(soft, [[0.125, 0.125, 0.375, 0.375]])
+
+
+def test_C_prob_level_discovery_and_explicit_levels():
+    from patsy.highlevel import dmatrix
+
+    # Levels come from categories with positive mass, and are sorted.
+    m = dmatrix("0 + C_prob(p)", {"p": [{"b": 1.0}, {"a": 0.5, "b": 0.5}]})
+    assert m.design_info.column_names == ["C_prob(p)[a]", "C_prob(p)[b]"]
+
+    # Categories with zero mass do not create levels.
+    m = dmatrix("0 + C_prob(p)", {"p": [{"a": 1.0, "c": 0.0}]})
+    assert m.design_info.column_names == ["C_prob(p)[a]"]
+
+    # Explicit levels override discovery and ordering.
+    m = dmatrix("0 + C_prob(p, levels=['b', 'a'])", {"p": [{"a": 1.0}, {"b": 1.0}]})
+    assert m.design_info.column_names == [
+        "C_prob(p, levels=['b', 'a'])[b]",
+        "C_prob(p, levels=['b', 'a'])[a]",
+    ]
+    assert np.allclose(m, [[0, 1], [1, 0]])
+
+    # Explicit contrast is honoured.
+    m = dmatrix("C_prob(p, Sum)", {"p": [{"a": 1.0}, {"b": 1.0}]})
+    assert m.design_info.column_names == ["Intercept", "C_prob(p, Sum)[S.a]"]
+
+
+def test_C_prob_prediction_unknown_category():
+    from patsy.highlevel import dmatrix
+
+    train = {"p": [{"a": 1.0}, {"b": 1.0}, {"a": 0.5, "b": 0.5}]}
+    design_info = dmatrix("C_prob(p)", train).design_info
+
+    # Unknown category with positive mass is an error, not dropped.
+    pytest.raises(
+        PatsyError,
+        build_design_matrices,
+        [design_info],
+        {"p": [{"a": 1.0}, {"c": 1.0}]},
+    )
+    # ... but one with zero mass is harmless.
+    (m,) = build_design_matrices([design_info], {"p": [{"a": 1.0}, {"c": 0.0}]})
+    assert np.allclose(m, [[1, 0], [1, 0]])
+
+
+def test_C_prob_NA_handling():
+    from patsy.highlevel import dmatrix
+
+    design_info = dmatrix(
+        "C_prob(p, levels=['a', 'b'])", {"p": [{"a": 1.0}, {"b": 1.0}]}
+    ).design_info
+
+    # Empty mapping and zero total are categorical missing.
+    data = {"p": [{"a": 1.0}, {}, {"a": 0, "b": 0}, {"b": 1.0}]}
+    (m,) = build_design_matrices([design_info], data)
+    assert m.shape == (2, 2)
+    assert np.allclose(m, [[1, 0], [1, 1]])
+
+    pytest.raises(
+        PatsyError, build_design_matrices, [design_info], data, NA_action="raise"
+    )
+
+
+def test_C_prob_invalid_weights():
+    from patsy.highlevel import dmatrix
+
+    for bad in ({"a": -1.0}, {"a": np.nan}, {"a": np.inf}, {"a": "x"}):
+        pytest.raises(PatsyError, dmatrix, "C_prob(p)", {"p": [bad]})
+
+
+def test_C_prob_DesignInfo_subset():
+    from patsy.highlevel import dmatrix
+
+    train = {
+        "p": [{"a": 1.0}, {"b": 1.0}, {"a": 0.5, "b": 0.5}],
+        "x": [1.0, 2.0, 3.0],
+    }
+    full = dmatrix("1 + C_prob(p) + x", train)
+    sub = full.design_info.subset(["Intercept", "C_prob(p)"])
+    assert sub.column_names == full.design_info.column_names[:2]
+    (m,) = build_design_matrices([sub], train)
+    assert np.allclose(m, full[:, :2])
+
+    # The removed factor ('x') need not be present when predicting from the
+    # subset.
+    (m2,) = build_design_matrices([sub], {"p": train["p"]})
+    assert np.allclose(m2, full[:, :2])
+
+    # ... and term objects work as well as names.
+    term_objs = [t for t in full.design_info.terms if t.name() == "C_prob(p)"]
+    sub2 = full.design_info.subset(term_objs)
+    assert sub2.column_names == full.design_info.column_names[1:2]
+    (m3,) = build_design_matrices([sub2], {"p": train["p"]})
+    assert np.allclose(m3, full[:, 1:2])
+
+
+def test_C_prob_pandas_index():
+    if not have_pandas:
+        return
+    from patsy.highlevel import dmatrix
+
+    df = pandas.DataFrame(
+        {"p": [{"a": 1.0}, {}, {"b": 1.0}], "x": [1.0, 2.0, 3.0]},
+        index=[7, 8, 9],
+    )
+    out = dmatrix("C_prob(p) + x", df, return_type="dataframe")
+    assert out.index.tolist() == [7, 9]
+    assert np.allclose(out.values, [[1, 0, 1], [1, 1, 3]])
+
+
+def test_C_prob_misc():
+    from patsy.highlevel import dmatrix
+
+    # Non-string categories work, and are sorted with the usual rules.
+    m = dmatrix("0 + C_prob(p)", {"p": [{1: 1.0}, {2: 1.0}]})
+    assert m.design_info.column_names == ["C_prob(p)[1]", "C_prob(p)[2]"]
+    m = dmatrix("0 + C_prob(p)", {"p": [{True: 1.0}, {False: 1.0}]})
+    assert m.design_info.column_names == ["C_prob(p)[False]", "C_prob(p)[True]"]
+
+    # Accidentally passing raw mappings as a plain factor gives a helpful
+    # error rather than a confusing one.
+    pytest.raises(PatsyError, dmatrix, "p", {"p": [{"a": 1.0}]})
+
+    # Empty data with explicit levels still builds an empty (zero-row)
+    # matrix, matching C's NA-drop behaviour.
+    m = dmatrix("C_prob(p, levels=['a', 'b'])", {"p": [{}, {}]})
+    assert m.shape == (0, 2)
+    assert m.design_info.column_names == [
+        "Intercept",
+        "C_prob(p, levels=['a', 'b'])[T.b]",
+    ]
+
+
+def test_C_prob_misuse():
+    from patsy.categorical import C_prob
+    from patsy.highlevel import dmatrix
+
+    # Wrapping probability data in C() is a mistake and is reported clearly.
+    pytest.raises(
+        PatsyError,
+        dmatrix,
+        "0 + C(p)",
+        {"p": C_prob([{"a": 1.0}])},
+    )

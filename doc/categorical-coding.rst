@@ -95,3 +95,41 @@ And it can now be used just like the built-in methods:
    dmatrix("C(a, MyTreat)", data)
    # With argument:
    dmatrix("C(a, MyTreat(2))", data)
+
+Categorical data given as probabilities
+---------------------------------------
+
+Sometimes the upstream data isn't a single hard label per observation, but a
+distribution over categories -- for example the predicted class probabilities
+from a classifier. :func:`C_prob` handles this case. Each observation is a
+mapping from category to a non-negative weight:
+
+.. ipython:: python
+
+   probs = [{"a1": 0.7, "a2": 0.3},
+            {"a1": 1.0},
+            {"a2": 0.5, "a3": 0.5},
+            {"a3": 1.0}]
+   dmatrix("C_prob(p)", {"p": probs})
+
+The weights in each row are normalized to sum to one, and the resulting
+columns are the weighted average of the contrast matrix rows that :func:`C`
+would use for the corresponding levels. In particular, a point distribution
+(a single category) produces exactly the same numbers as :func:`C` would, and
+:func:`C_prob` accepts the same `levels` and `contrast` arguments as
+:func:`C`:
+
+.. ipython:: python
+
+   dmatrix("C_prob(p, Sum, levels=['a3', 'a2', 'a1'])", {"p": probs})
+
+When :func:`C_prob` appears in an interaction, its encoded columns are
+multiplied with those of the other factors, just like any other categorical
+factor.
+
+Levels are discovered from all categories that carry positive weight in the
+training data. When predicting on new data the vocabulary is fixed: a
+category with positive weight that was not seen during training raises an
+error (it is never silently discarded). An observation with an empty mapping,
+or with a total weight of zero, is treated as missing data and handled by the
+usual ``NA_action``. Negative or non-finite weights raise an error.

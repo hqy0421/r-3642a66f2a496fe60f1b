@@ -14,6 +14,10 @@ v1.0.3
 * Added official support for Python 3.14.
 * Fixed constraint tokenizer compatibility with Python 3.15 pre-releases.
 * Updates to CI tooling and doc building.
+* Added :func:`C_prob`, an optional categorical factor that accepts per-row
+  category probabilities (or non-negative weights) instead of a single label.
+  Rows are normalized to sum to one and encoded as the weighted average of the
+  contrast matrix rows; a point distribution matches :func:`C` exactly.
 
 v1.0.2
 ------

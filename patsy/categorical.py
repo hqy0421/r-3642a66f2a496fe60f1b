@@ -2,7 +2,13 @@
 # Copyright (C) 2011-2013 Nathaniel Smith <njs@pobox.com>
 # See file LICENSE.txt for license information.
 
-__all__ = ["C", "guess_categorical", "CategoricalSniffer", "categorical_to_int"]
+__all__ = [
+    "C",
+    "C_prob",
+    "guess_categorical",
+    "CategoricalSniffer",
+    "categorical_to_int",
+]
 
 # How we handle categorical data: the big picture
 # -----------------------------------------------
@@ -31,6 +37,9 @@ __all__ = ["C", "guess_categorical", "CategoricalSniffer", "categorical_to_int"]
 # that type. But we had to get rid of that type, so now this file just
 # provides a set of plain old functions which are used by patsy.build to
 # handle the different stages of categorical data munging.
+
+import numbers
+from collections.abc import Mapping
 
 import numpy as np
 
@@ -129,10 +138,96 @@ def test_C():
     assert_no_pickling(c4)
 
 
+# Like _CategoricalBox, but instead of a single observed level per row, each
+# row may carry a non-negative weight for any number of levels. These weights
+# are normalized per row and then averaged against the categorical contrast
+# matrix.
+class _ProbabilityCategoricalBox(object):
+    def __init__(self, data, contrast, levels):
+        self.data = data
+        self.contrast = contrast
+        self.levels = levels
+
+    __getstate__ = no_pickling
+
+
+def C_prob(data, contrast=None, levels=None):
+    """
+    Marks some `data` as a categorical factor given by per-row category
+    probabilities (or, equivalently, non-negative weights).
+
+    This is an optional alternative to :func:`C` for the case where an
+    upstream model produces a distribution over categories for each
+    observation, rather than a single hard label. Each observation must be a
+    mapping from category to non-negative finite weight, for example::
+
+      dmatrix("C_prob(p)", {"p": [{"a": 0.7, "b": 0.3},
+                                  {"a": 1.0},
+                                  {"b": 1.0}]})
+
+    Semantics:
+
+    * For each row, the weights are normalized by their total (which must be
+      positive). The resulting design-matrix columns are then the weighted
+      average of the rows of the contrast matrix that :func:`C` would use for
+      those levels: ``sum(level_weight * contrast[level])``.
+    * In particular, a point distribution (a single category with weight 1, or
+      equivalently any single non-zero weight) produces exactly the same
+      values as :func:`C` would for that level, under the same `levels` and
+      `contrast`.
+    * When this factor is used in an interaction, its encoded columns are
+      multiplied elementwise with the encoded columns of the other factors,
+      just like any other categorical factor.
+    * Levels are discovered from all categories carrying *positive* mass in
+      the training data, and sorted in the usual way. The `levels` and
+      `contrast` arguments override this, exactly as they do for :func:`C`.
+    * At prediction time the vocabulary is fixed: an observation containing a
+      category with positive mass that is not among the levels raises a
+      :class:`PatsyError`, rather than silently dropping that mass and
+      re-normalizing the rest.
+    * An empty mapping, or one whose total weight is zero, is treated as a
+      categorical missing value, and is handled according to the usual
+      ``NA_action`` (i.e. dropped by default).
+    * Negative or non-finite weights raise a :class:`PatsyError`.
+
+    The `contrast` and `levels` arguments have exactly the same meaning as for
+    :func:`C`.
+    """
+    if isinstance(data, _ProbabilityCategoricalBox):
+        if contrast is None:
+            contrast = data.contrast
+        if levels is None:
+            levels = data.levels
+        data = data.data
+    return _ProbabilityCategoricalBox(data, contrast, levels)
+
+
+def test_C_prob():
+    c1 = C_prob("asdf")
+    assert isinstance(c1, _ProbabilityCategoricalBox)
+    assert c1.data == "asdf"
+    assert c1.levels is None
+    assert c1.contrast is None
+    c2 = C_prob("DATA", "CONTRAST", "LEVELS")
+    assert c2.data == "DATA"
+    assert c2.contrast == "CONTRAST"
+    assert c2.levels == "LEVELS"
+    c3 = C_prob(c2, levels="NEW LEVELS")
+    assert c3.data == "DATA"
+    assert c3.contrast == "CONTRAST"
+    assert c3.levels == "NEW LEVELS"
+    c4 = C_prob(c2, "NEW CONTRAST")
+    assert c4.data == "DATA"
+    assert c4.contrast == "NEW CONTRAST"
+    assert c4.levels == "LEVELS"
+
+    assert_no_pickling(c4)
+
+
 def guess_categorical(data):
     if safe_is_pandas_categorical(data):
         return True
-    if isinstance(data, _CategoricalBox):
+    if isinstance(data, (_CategoricalBox, _ProbabilityCategoricalBox)):
         return True
     data = np.asarray(data)
     if safe_issubdtype(data.dtype, np.number):
@@ -171,6 +266,237 @@ def _categorical_shape_fix(data):
     return data
 
 
+def _probability_observations(data, origin=None):
+    # Normalize the various container shapes into a list of per-observation
+    # objects. A bare mapping is a single observation; anything else must be a
+    # 1-d iterable of observations.
+    if isinstance(data, Mapping):
+        return [data]
+    if hasattr(data, "ndim") and data.ndim > 1:
+        raise PatsyError("categorical data cannot be >1-dimensional", origin)
+    if not iterable(data) or isinstance(data, (str, bytes)):
+        return [data]
+    return list(data)
+
+
+def _probability_weight(weight, category, origin):
+    # Validate a single weight and return it as a float. Raises PatsyError for
+    # anything that isn't a finite, non-negative real number.
+    if not isinstance(weight, numbers.Real):
+        raise PatsyError(
+            "Error interpreting categorical probabilities: weight for "
+            "category %r must be a real number, not %r" % (category, weight),
+            origin,
+        )
+    weight = float(weight)
+    if not np.isfinite(weight):
+        raise PatsyError(
+            "Error interpreting categorical probabilities: weight for "
+            "category %r must be finite, got %r" % (category, weight),
+            origin,
+        )
+    if weight < 0:
+        raise PatsyError(
+            "Error interpreting categorical probabilities: weight for "
+            "category %r must be non-negative, got %r" % (category, weight),
+            origin,
+        )
+    return weight
+
+
+def _as_probability_observation(obs, origin):
+    # Validates that `obs` is a mapping and returns an iterable of
+    # (category, validated_float_weight) pairs.
+    if not isinstance(obs, Mapping):
+        raise PatsyError(
+            "Error interpreting categorical probabilities: each "
+            "observation must be a mapping from category to weight, "
+            "not %r" % (obs,),
+            origin,
+        )
+    return [
+        (category, _probability_weight(weight, category, origin))
+        for category, weight in obs.items()
+    ]
+
+
+def _ellipsized_level_str(levels):
+    SHOW_LEVELS = 4
+    level_strs = []
+    if len(levels) <= SHOW_LEVELS:
+        level_strs += [repr(level) for level in levels]
+    else:
+        level_strs += [repr(level) for level in levels[: SHOW_LEVELS // 2]]
+        level_strs.append("...")
+        level_strs += [repr(level) for level in levels[-SHOW_LEVELS // 2 :]]
+    return "[%s]" % (", ".join(level_strs))
+
+
+def probability_to_matrix(data, levels, NA_action, origin=None):
+    """Convert per-row category probabilities into a dense (n_rows, n_levels)
+    weight matrix.
+
+    Returns ``(matrix, is_NA)``. Rows that carry no usable mass (an empty
+    mapping, or a total weight of zero, or a positive weight on an NA
+    category) are marked in ``is_NA`` and filled with NaN, so that the usual
+    NA handling applies. A positive weight on an unknown category raises a
+    :class:`PatsyError`; it is never silently dropped.
+    """
+    assert isinstance(levels, tuple)
+
+    if isinstance(data, _ProbabilityCategoricalBox):
+        if data.levels is not None and tuple(data.levels) != levels:
+            raise PatsyError(
+                "mismatching levels: expected %r, got %r"
+                % (levels, tuple(data.levels)),
+                origin,
+            )
+        data = data.data
+
+    index = None
+    if have_pandas and isinstance(data, pandas.Series):
+        index = data.index
+
+    observations = _probability_observations(data, origin)
+
+    try:
+        level_to_int = dict(zip(levels, range(len(levels))))
+    except TypeError:
+        raise PatsyError(
+            "Error interpreting categorical data: all items must be hashable", origin
+        )
+
+    out = np.zeros((len(observations), len(levels)), dtype=float)
+    is_NA = np.zeros(len(observations), dtype=bool)
+    for i, obs in enumerate(observations):
+        if NA_action.is_categorical_NA(obs):
+            is_NA[i] = True
+            out[i, :] = np.nan
+            continue
+        total = 0.0
+        entries = []
+        has_NA_category = False
+        for category, weight in _as_probability_observation(obs, origin):
+            if weight == 0:
+                continue
+            total += weight
+            if NA_action.is_categorical_NA(category):
+                # A category which is itself missing cannot be represented as
+                # a level; treat the whole observation as missing.
+                has_NA_category = True
+                continue
+            try:
+                column = level_to_int[category]
+            except KeyError:
+                raise PatsyError(
+                    "Error converting data to categorical probabilities: "
+                    "observation contains category %r with positive weight, "
+                    "which does not match any of the expected levels "
+                    "(expected: %s)" % (category, _ellipsized_level_str(levels)),
+                    origin,
+                )
+            except TypeError:
+                raise PatsyError(
+                    "Error converting data to categorical probabilities: "
+                    "encountered unhashable category %r" % (category,),
+                    origin,
+                )
+            entries.append((column, weight))
+        if has_NA_category or total <= 0 or not entries:
+            is_NA[i] = True
+            out[i, :] = np.nan
+            continue
+        for column, weight in entries:
+            out[i, column] = weight / total
+
+    if index is not None:
+        out = pandas.DataFrame(out, index=index)
+    return out, is_NA
+
+
+def test_probability_to_matrix():
+    import pytest
+    from patsy.missing import NAAction
+
+    def t(data, levels, expected, expected_NA=None, NA_action=NAAction()):
+        got, is_NA = probability_to_matrix(data, levels, NA_action)
+        assert np.allclose(got, expected, equal_nan=True)
+        if expected_NA is None:
+            assert not np.any(is_NA)
+        else:
+            assert np.array_equal(is_NA, expected_NA)
+
+    t([{"a": 1}], ("a", "b"), [[1.0, 0.0]])
+    t([{"a": 2}], ("a", "b"), [[1.0, 0.0]])
+    t([{"a": 1, "b": 1}], ("a", "b"), [[0.5, 0.5]])
+    t([{"a": 1, "b": 3}], ("b", "a"), [[0.75, 0.25]])
+    # zero-weight categories are ignored
+    t([{"a": 1, "b": 0}], ("a", "b"), [[1.0, 0.0]])
+    # empty / zero total -> NA
+    t([{}], ("a", "b"), [[np.nan, np.nan]], [True])
+    t([{"a": 0, "b": 0}], ("a", "b"), [[np.nan, np.nan]], [True])
+    # NA observations -> NA
+    t([None], ("a", "b"), [[np.nan, np.nan]], [True])
+    # NA category with positive mass -> whole row NA
+    t(
+        [{"a": 1, None: 1}],
+        ("a", "b"),
+        [[np.nan, np.nan]],
+        [True],
+        NAAction(NA_types=["None"]),
+    )
+
+    # unknown category with positive mass -> error, not dropped
+    pytest.raises(
+        PatsyError, probability_to_matrix, [{"a": 1, "c": 1}], ("a", "b"), NAAction()
+    )
+    # unknown category with zero mass is fine
+    t([{"a": 1, "c": 0}], ("a", "b"), [[1.0, 0.0]])
+    # negative / non-finite weights -> error
+    pytest.raises(
+        PatsyError, probability_to_matrix, [{"a": -1}], ("a", "b"), NAAction()
+    )
+    pytest.raises(
+        PatsyError, probability_to_matrix, [{"a": np.nan}], ("a", "b"), NAAction()
+    )
+    pytest.raises(
+        PatsyError, probability_to_matrix, [{"a": np.inf}], ("a", "b"), NAAction()
+    )
+    pytest.raises(
+        PatsyError, probability_to_matrix, [{"a": "x"}], ("a", "b"), NAAction()
+    )
+    # non-mapping observation -> error
+    pytest.raises(PatsyError, probability_to_matrix, ["a"], ("a", "b"), NAAction())
+
+    # explicit levels mismatch
+    pytest.raises(
+        PatsyError,
+        probability_to_matrix,
+        C_prob([{"a": 1}], levels=["a", "b"]),
+        ("b", "a"),
+        NAAction(),
+    )
+
+    # 0-d mapping is a single observation
+    t({"a": 1}, ("a", "b"), [[1.0, 0.0]])
+
+    # >1d is disallowed
+    pytest.raises(
+        PatsyError,
+        probability_to_matrix,
+        np.asarray([[{"a": 1}]]),
+        ("a", "b"),
+        NAAction(),
+    )
+
+    if have_pandas:
+        s = pandas.Series([{"a": 1}, {"b": 1}], index=[10, 20])
+        got, _ = probability_to_matrix(s, ("a", "b"), NAAction())
+        assert isinstance(got, pandas.DataFrame)
+        assert np.array_equal(got.index, [10, 20])
+        assert np.array_equal(got.values, [[1.0, 0.0], [0.0, 1.0]])
+
+
 class CategoricalSniffer(object):
     def __init__(self, NA_action, origin=None):
         self._NA_action = NA_action
@@ -197,6 +523,15 @@ class CategoricalSniffer(object):
             else:
                 # unbox and fall through
                 data = data.data
+        if isinstance(data, _ProbabilityCategoricalBox):
+            if data.levels is not None:
+                self._levels = tuple(data.levels)
+                return True
+            else:
+                # unbox and fall through, but remember that these are
+                # probability observations
+                data = data.data
+                return self._sniff_probability(data)
         if safe_is_pandas_categorical(data):
             # pandas.Categorical has its own NA detection, so don't try to
             # second-guess it.
@@ -213,6 +548,13 @@ class CategoricalSniffer(object):
         for value in data:
             if self._NA_action.is_categorical_NA(value):
                 continue
+            if isinstance(value, Mapping):
+                raise PatsyError(
+                    "Error interpreting categorical data: found a mapping "
+                    "from categories to weights; if this is per-row category "
+                    "probability data, wrap it in C_prob()",
+                    self._origin,
+                )
             if value is True or value is False:
                 self._level_set.update([True, False])
             else:
@@ -227,6 +569,29 @@ class CategoricalSniffer(object):
         # If everything we've seen is boolean, assume that everything else
         # would be too. Otherwise we need to keep looking.
         return self._level_set == set([True, False])
+
+    def _sniff_probability(self, data):
+        # Discovers levels from the categories that carry positive mass. As
+        # with ordinary categorical data, we cannot be sure we have seen every
+        # level until we have looked at all the data (unless explicit levels
+        # were given), so always return False.
+        for obs in _probability_observations(data, self._origin):
+            if self._NA_action.is_categorical_NA(obs):
+                continue
+            for category, weight in _as_probability_observation(obs, self._origin):
+                if weight <= 0:
+                    continue
+                if self._NA_action.is_categorical_NA(category):
+                    continue
+                try:
+                    self._level_set.add(category)
+                except TypeError:
+                    raise PatsyError(
+                        "Error interpreting categorical probabilities: "
+                        "all categories must be hashable",
+                        self._origin,
+                    )
+        return False
 
     __getstate__ = no_pickling
 
@@ -347,6 +712,13 @@ def categorical_to_int(data, levels, NA_action, origin=None):
                 origin,
             )
         data = data.data
+
+    if isinstance(data, _ProbabilityCategoricalBox):
+        raise PatsyError(
+            "probability-category data (from C_prob) must be used directly, "
+            "not wrapped in C()",
+            origin,
+        )
 
     data = _categorical_shape_fix(data)
 
